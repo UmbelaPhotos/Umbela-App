@@ -7,6 +7,7 @@ import 'package:connectrpc/protobuf.dart';
 import 'package:connectrpc/protocol/connect.dart' as protocol;
 
 import '../../gen/v1/auth.connect.client.dart';
+import '../../gen/v1/auth.pb.dart' show IdentifyRequest;
 import '../../gen/v1/photo.connect.client.dart';
 import '../security/pairing.dart';
 import 'session_interceptor.dart';
@@ -40,7 +41,9 @@ class ConnectClientManager {
     _server = server;
     final http = io.HttpClient()
       ..findProxy = ((_) => 'DIRECT')
-      ..idleTimeout = const Duration(seconds: 30)
+      // Opening a connection to an onion costs a whole circuit; keep the
+      // ones we have open for a good while.
+      ..idleTimeout = const Duration(minutes: 5)
       ..connectionFactory = (uri, _, _) {
         final tunnel = socks5Connect(
           proxyHost: tor.socksHost,
@@ -67,6 +70,21 @@ class ConnectClientManager {
         ),
       ],
     );
+    unawaited(_warmUp());
+  }
+
+  /// Opens a few connections ahead of time (each one a Tor circuit to the
+  /// onion) so the first screen of thumbnails does not pay for building them.
+  /// `Identify` needs no session and is cheap; the answer is discarded.
+  Future<void> _warmUp({int connections = 3}) async {
+    final transport = _transport;
+    if (transport == null) return;
+    await Future.wait([
+      for (var i = 0; i < connections; i++)
+        AuthServiceClient(transport)
+            .identify(IdentifyRequest(nonce: List.filled(32, i)))
+            .then<void>((_) {}, onError: (Object _) {}),
+    ]);
   }
 
   protocol.Transport get _t {

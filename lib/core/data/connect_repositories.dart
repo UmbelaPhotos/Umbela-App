@@ -1,8 +1,11 @@
 import 'package:flutter/foundation.dart' show debugPrint;
 
+import 'dart:async';
+import 'dart:io' show SocketException;
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:connectrpc/connect.dart' show Code, ConnectException;
 import 'package:fixnum/fixnum.dart';
 
 import '../../gen/v1/auth.pb.dart' as auth;
@@ -10,7 +13,8 @@ import '../../gen/v1/photo.pb.dart' as pb;
 import '../network/connect_client.dart';
 import '../security/pairing.dart';
 import '../security/server_identity.dart';
-import '../utils/lifo_gate.dart';
+import '../utils/priority_gate.dart';
+import '../utils/thumb_interest.dart';
 import 'models.dart';
 import 'repositories.dart';
 
@@ -49,12 +53,58 @@ Place _place(pb.PlaceSummary p) => Place(
   longitude: p.longitude,
 );
 
-Future<Uint8List> _collect(Stream<pb.Chunk> chunks) async {
+Future<Uint8List> _collect(
+  Stream<pb.Chunk> chunks, {
+  Duration? stall,
+  bool Function()? abandon,
+}) async {
   final out = BytesBuilder(copy: false);
-  await for (final c in chunks) {
+  // With [stall], a stream that goes quiet that long fails with a
+  // TimeoutException (and is cancelled) instead of hanging forever.
+  // With [abandon], a request that has not got its first bytes after a few
+  // seconds is dropped as soon as nobody wants the result any more.
+  final started = Stopwatch()..start();
+  final timed = stall == null ? chunks : chunks.timeout(stall);
+  final stream = abandon == null
+      ? timed
+      : _abortable(
+          timed,
+          () => out.isEmpty && started.elapsed > _abandonAfter && abandon(),
+        );
+  await for (final c in stream) {
     out.add(c.data);
   }
   return out.takeBytes();
+}
+
+const _abandonAfter = Duration(seconds: 3);
+
+class _Abandoned implements Exception {
+  @override
+  String toString() => 'Petición abandonada: ya no se necesita.';
+}
+
+/// [source] until [shouldStop] turns true (checked once a second): then the
+/// source is cancelled and the stream fails with [_Abandoned].
+Stream<T> _abortable<T>(Stream<T> source, bool Function() shouldStop) async* {
+  final ctrl = StreamController<T>();
+  final sub = source.listen(
+    ctrl.add,
+    onError: ctrl.addError,
+    onDone: ctrl.close,
+  );
+  final timer = Timer.periodic(const Duration(seconds: 1), (_) {
+    if (ctrl.isClosed || !shouldStop()) return;
+    sub.cancel();
+    ctrl.addError(_Abandoned());
+    ctrl.close();
+  });
+  try {
+    yield* ctrl.stream;
+  } finally {
+    timer.cancel();
+    await sub.cancel();
+  }
 }
 
 /// Thrown when the server does not hold the key from the pairing QR. The KEK
@@ -185,26 +235,75 @@ class ConnectPhotoRepository implements PhotoRepository {
     );
   }
 
-  /// Thumbnails share a few slots, newest request first, so a full image or
-  /// a page of details never waits behind a whole screen of thumbnails.
-  final _thumbGate = LifoGate(4);
+  /// Thumbnails share a few slots. The next one is the cell nearest the top
+  /// of the screen (see [ThumbInterest]); cells that scrolled away wait.
+  /// A full image or a page of details never queues behind them.
+  late final _thumbGate = _makeThumbGate();
+
+  PriorityGate _makeThumbGate() {
+    final gate = PriorityGate(4);
+    thumbInterest.addListener(gate.nudge);
+    return gate;
+  }
+
+  /// No data at all for this long and the request is given up on.
+  static const _thumbStall = Duration(seconds: 15);
+  static const _thumbRetryDelays = [Duration(seconds: 1), Duration(seconds: 3)];
 
   @override
   Future<Uint8List> thumbnail(String photoId) async {
     final queued = Stopwatch()..start(); // [perf]
-    return _thumbGate.run(() async {
-      final waited = queued.elapsedMilliseconds; // [perf]
-      final bytes = await _collect(
-        _client.photos.streamThumbnail(
-          pb.GetThumbnailRequest(photoId: photoId, maxSize: 300),
-        ),
-      );
-      debugPrint(
-        '[perf] thumb ${photoId.substring(0, 8)}: ${bytes.length ~/ 1024} KB, '
-        'queue=${waited}ms total=${queued.elapsedMilliseconds}ms',
-      ); // [perf]
-      return bytes;
-    });
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _thumbGate.run(() {
+          debugPrint(
+            '[perf] thumb ${photoId.substring(0, 8)}: '
+            'queue=${queued.elapsedMilliseconds}ms',
+          ); // [perf]
+          return _fetchThumbnail(photoId);
+        }, priority: () => thumbInterest.priorityOf(photoId));
+      } catch (e) {
+        if (attempt >= _thumbRetryDelays.length || !_retryable(e)) rethrow;
+        debugPrint(
+          '[perf] thumb ${photoId.substring(0, 8)}: retry ${attempt + 1} ($e)',
+        ); // [perf]
+        // The slot is free while we wait, so others are not held up.
+        await Future<void>.delayed(_thumbRetryDelays[attempt]);
+      }
+    }
+  }
+
+  Future<Uint8List> _fetchThumbnail(String photoId) async {
+    final started = Stopwatch()..start(); // [perf]
+    final bytes = await _collect(
+      _client.photos.streamThumbnail(
+        pb.GetThumbnailRequest(photoId: photoId, maxSize: 300),
+      ),
+      stall: _thumbStall,
+      abandon: () => thumbInterest.priorityOf(photoId) == null,
+    );
+    debugPrint(
+      '[perf] thumb ${photoId.substring(0, 8)}: ${bytes.length ~/ 1024} KB, '
+      'fetch=${started.elapsedMilliseconds}ms',
+    ); // [perf]
+    return bytes;
+  }
+
+  /// Network trouble is worth another go; a definite answer from the server
+  /// (not found, not allowed, session expired) is not.
+  static bool _retryable(Object e) {
+    if (e is _Abandoned) return false;
+    if (e is ConnectException) {
+      return switch (e.code) {
+        Code.notFound ||
+        Code.unauthenticated ||
+        Code.permissionDenied ||
+        Code.invalidArgument ||
+        Code.canceled => false,
+        _ => true,
+      };
+    }
+    return (e is TimeoutException || e is SocketException) && e is! _Abandoned;
   }
 
   @override

@@ -11,6 +11,7 @@ import 'package:umbela_app/core/providers.dart';
 import 'package:umbela_app/core/storage/timeline_cache.dart';
 import 'package:umbela_app/core/timeline/timeline_controller.dart';
 import 'package:umbela_app/core/utils/lifo_gate.dart';
+import 'package:umbela_app/core/utils/priority_gate.dart';
 import 'package:umbela_app/core/widgets/photo_grid.dart';
 import 'package:umbela_app/core/widgets/photo_thumb.dart';
 import 'package:umbela_app/features/timeline/presentation/timeline_layout.dart';
@@ -391,5 +392,38 @@ void main() {
     hold.complete();
     await Future.wait([running, a, b, c]);
     expect(order, [3, 2, 1]);
+  });
+
+  test(
+    'PriorityGate starts the lowest priority first, re-read at dequeue',
+    () async {
+      final gate = PriorityGate(1, coalesce: Duration.zero);
+      final order = <String>[];
+      final hold = Completer<void>();
+      final running = gate.run(() => hold.future, priority: () => 0);
+      final prio = {'a': 30.0, 'b': 10.0, 'c': 20.0};
+      final tasks = [
+        for (final k in prio.keys)
+          gate.run(() async => order.add(k), priority: () => prio[k]),
+      ];
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      prio['a'] = 1; // scrolled: now the most urgent
+      hold.complete();
+      await Future.wait([running, ...tasks]);
+      expect(order, ['a', 'b', 'c']);
+    },
+  );
+
+  test('PriorityGate keeps ineligible tasks waiting until nudged', () async {
+    final gate = PriorityGate(2, coalesce: Duration.zero);
+    double? p;
+    var ran = false;
+    final t = gate.run(() async => ran = true, priority: () => p);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    expect(ran, isFalse);
+    p = 1;
+    gate.nudge();
+    await t;
+    expect(ran, isTrue);
   });
 }

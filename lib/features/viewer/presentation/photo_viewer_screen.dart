@@ -13,6 +13,7 @@ import '../../../core/data/models.dart';
 import '../../../core/providers.dart';
 import '../../../core/timeline/timeline_controller.dart';
 import '../../../core/utils/image_helpers.dart';
+import '../../../core/utils/thumb_interest.dart';
 import '../../../core/widgets/common.dart';
 import '../../../core/widgets/person_avatar.dart';
 
@@ -102,6 +103,7 @@ class _PhotoViewerScreenState extends ConsumerState<PhotoViewerScreen> {
     // Warm the neighbours so the next swipe shows a picture straight away.
     for (final n in [i - 1, i + 1]) {
       if (n >= 0 && n < _photos.length) {
+        thumbInterest.pin(_photos[n].id);
         ref.read(thumbnailProvider(_photos[n].id));
       }
     }
@@ -254,6 +256,7 @@ class _PhotoAreaState extends ConsumerState<_PhotoArea> {
     final photoId = widget.photoId;
     final initial = widget.initial;
     final meta = initial ?? ref.watch(photoMetaProvider(photoId));
+    thumbInterest.pin(photoId);
     final thumb = ref.watch(thumbnailProvider(photoId)).value;
     final full = _wantFull
         ? ref.watch(photoBytesProvider(photoId)).value

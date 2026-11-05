@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/theme/app_icons.dart';
 import '../data/models.dart';
 import '../providers.dart';
+import '../utils/thumb_interest.dart';
 import '../utils/image_helpers.dart';
 
 /// An album's picture: the thumbnail of its cover photo. While it loads, or
@@ -34,6 +35,7 @@ class AlbumCover extends ConsumerWidget {
         ref.watch(coverOverridesProvider)['album:${album?.id}'] ??
         album?.coverPhotoId ??
         '';
+    if (cover.isNotEmpty) thumbInterest.pin(cover);
     final bytes = cover.isEmpty
         ? null
         : ref.watch(thumbnailProvider(cover)).value;
